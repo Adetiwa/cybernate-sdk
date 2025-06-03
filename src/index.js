@@ -158,7 +158,14 @@ class CybernateAI {
       throw new Error('webhookUrl is required for webhook notifications');
     }
     
-    // Set up the watcher
+    // Debug: Log the request details
+    console.log('Watch request:', {
+      endpoint,
+      payload,
+      apiKey: this.apiKey ? 'Present' : 'Missing'
+    });
+    
+    // Set up the watcher with explicit authentication
     const response = await this._request('POST', endpoint, payload);
     
     // Store active watcher
@@ -853,7 +860,7 @@ class CybernateAI {
   // ===== PRIVATE METHODS =====
 
   /**
-   * Make API request
+   * Make API request with enhanced authentication
    * @param {string} method - HTTP method
    * @param {string} path - API path
    * @param {Object} [data] - Request data
@@ -863,10 +870,13 @@ class CybernateAI {
   async _request(method, path, data = null) {
     const url = `${this.baseUrl}${path}`;
     
+    // Multiple authentication header formats for compatibility
     const headers = {
       'Authorization': `Bearer ${this.apiKey}`,
+      'X-API-Key': this.apiKey,
       'Content-Type': 'application/json',
-      'User-Agent': 'Cybernate-SDK/1.0'
+      'User-Agent': 'Cybernate-SDK/1.0',
+      'Accept': 'application/json'
     };
     
     const options = {
@@ -878,6 +888,18 @@ class CybernateAI {
     if (data && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
       options.body = JSON.stringify(data);
     }
+    
+    // Debug logging
+    console.log('API Request:', {
+      method,
+      url,
+      headers: {
+        ...headers,
+        'Authorization': headers.Authorization ? 'Bearer [REDACTED]' : 'Missing',
+        'X-API-Key': headers['X-API-Key'] ? '[REDACTED]' : 'Missing'
+      },
+      hasBody: !!options.body
+    });
     
     try {
       const response = await fetch(url, options);
@@ -893,15 +915,47 @@ class CybernateAI {
         this.rateLimit.reset = parseInt(response.headers.get('X-RateLimit-Reset'), 10);
       }
       
-      // Check for errors
+      // Enhanced error handling
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.message || `HTTP error ${response.status}`);
+        let errorData;
+        try {
+          errorData = await response.json();
+        } catch (e) {
+          errorData = { message: `HTTP ${response.status}: ${response.statusText}` };
+        }
+        
+        // Log the full error for debugging
+        console.error('API Error Response:', {
+          status: response.status,
+          statusText: response.statusText,
+          url,
+          errorData
+        });
+        
+        // Specific error messages for common issues
+        if (response.status === 401) {
+          throw new Error(`Authentication failed: ${errorData.message || 'Invalid API key'}`);
+        } else if (response.status === 403) {
+          throw new Error(`Access forbidden: ${errorData.message || 'Insufficient permissions'}`);
+        } else if (response.status === 404) {
+          throw new Error(`Endpoint not found: ${errorData.message || 'The requested resource was not found'}`);
+        } else if (response.status >= 500) {
+          throw new Error(`Server error: ${errorData.message || 'Internal server error'}`);
+        } else {
+          throw new Error(errorData.message || `HTTP error ${response.status}`);
+        }
       }
       
-      return await response.json();
+      const responseData = await response.json();
+      console.log('API Response:', { status: response.status, data: responseData });
+      
+      return responseData;
     } catch (error) {
-      // Enhance error with context
+      // Enhanced error context
+      if (error.message.includes('fetch')) {
+        throw new Error(`Network error: Unable to connect to ${url}. Please check your internet connection.`);
+      }
+      
       throw new Error(`API request failed: ${error.message}`);
     }
   }
