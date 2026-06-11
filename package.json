@@ -1,15 +1,16 @@
 {
   "name": "cybernate-ai",
-  "version": "0.0.3",
-  "description": "JavaScript SDK for Cybernate AI Security Platform",
+  "version": "0.1.0",
+  "description": "JavaScript SDK for Cybernate AI \u2014 general-purpose AI inference, conversations, embeddings, vision, and security monitoring",
   "main": "dist/index.js",
   "module": "dist/index.esm.js",
-  "types": "dist/index.d.ts",
+  "types": "types/index.d.ts",
   "browser": "dist/index.umd.js",
   "files": [
     "dist",
+    "types",
     "README.md",
-    "CHANGELOG.md"
+    "API_DOCUMENTATION.md"
   ],
   "scripts": {
     "build": "rollup -c",
@@ -20,18 +21,21 @@
     "lint:fix": "eslint src --ext .js --fix",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run clean && npm run build",
-    "dev": "rollup -c -w"
+    "dev": "rollup -c -w",
+    "smoke": "node smoke-test.js"
   },
   "keywords": [
-    "security",
     "ai",
-    "monitoring",
-    "surveillance",
-    "detection",
+    "llm",
+    "chat",
+    "embeddings",
+    "vision",
+    "africa",
     "cybernate",
     "sdk",
     "api",
-    "client"
+    "client",
+    "inference"
   ],
   "author": "Cybernate AI Team",
   "license": "MIT",

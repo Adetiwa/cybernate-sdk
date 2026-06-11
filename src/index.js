@@ -75,15 +75,12 @@ class CybernateAI {
       this.user = response.user;
       this.organization = response.organization;
       
-      // Only set up WebSocket if enabled and available
-      if (this.enableWebSocket && this._socketIsEnabled()) {
-        try {
-          await this._setupWebSocket();
-        } catch (socketError) {
-          console.warn('WebSocket connection failed, falling back to HTTP-only mode:', socketError.message);
-          // Don't throw error, just continue without WebSocket
-        }
+      try {
+        await this._setupWebSocket();
+      } catch (socketError) {
+        console.warn('WebSocket unavailable, using HTTP-only mode:', socketError.message);
       }
+
       
       this.isConnected = true;
       this.isConnecting = false;
@@ -128,22 +125,26 @@ class CybernateAI {
     
     // Determine what we're watching
     if (options.streamUrl) {
-      endpoint = '/streams/watch';
+      endpoint = '/events/watch';
       payload = {
-        url: options.streamUrl,
+        targetUrl: options.streamUrl,
+        type: 'stream',
+        id: options.businessId,
         name: options.name || `Stream ${new Date().toISOString()}`,
-        detectionSettings: options.detectionSettings || {}
+        // detectionSettings: options.detectionSettings || {}
       };
     } else if (options.deviceId) {
       endpoint = '/devices/watch';
       payload = {
-        deviceId: options.deviceId,
+        type: 'device',
+        id: options.deviceId,
         detectionSettings: options.detectionSettings || {}
       };
     } else {
       endpoint = '/businesses/watch';
       payload = {
-        businessId: options.businessId,
+        type: 'business',
+        id: options.businessId,
         detectionSettings: options.detectionSettings || {}
       };
     }
@@ -157,13 +158,6 @@ class CybernateAI {
     if (payload.notificationSettings.method === 'webhook' && !payload.notificationSettings.webhookUrl) {
       throw new Error('webhookUrl is required for webhook notifications');
     }
-    
-    // Debug: Log the request details
-    console.log('Watch request:', {
-      endpoint,
-      payload,
-      apiKey: this.apiKey ? 'Present' : 'Missing'
-    });
     
     // Set up the watcher with explicit authentication
     const response = await this._request('POST', endpoint, payload);
@@ -384,13 +378,12 @@ class CybernateAI {
     // Use fetch directly for multipart form data
     const url = `${this.baseUrl}/storage/upload`;
     
-    const response = await fetch(url, {
+    const response = await this._fetchWithTimeout(url, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${this.apiKey}`
       },
-      body: formData,
-      timeout: this.timeout
+      body: formData
     });
     
     if (!response.ok) {
@@ -869,8 +862,7 @@ class CybernateAI {
    */
   async _request(method, path, data = null) {
     const url = `${this.baseUrl}${path}`;
-    
-    // Multiple authentication header formats for compatibility
+
     const headers = {
       'Authorization': `Bearer ${this.apiKey}`,
       'X-API-Key': this.apiKey,
@@ -878,31 +870,18 @@ class CybernateAI {
       'User-Agent': 'Cybernate-SDK/1.0',
       'Accept': 'application/json'
     };
-    
+
     const options = {
       method,
-      headers,
-      timeout: this.timeout
+      headers
     };
-    
+
     if (data && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
       options.body = JSON.stringify(data);
     }
-    
-    // Debug logging
-    console.log('API Request:', {
-      method,
-      url,
-      headers: {
-        ...headers,
-        'Authorization': headers.Authorization ? 'Bearer [REDACTED]' : 'Missing',
-        'X-API-Key': headers['X-API-Key'] ? '[REDACTED]' : 'Missing'
-      },
-      hasBody: !!options.body
-    });
-    
+
     try {
-      const response = await fetch(url, options);
+      const response = await this._fetchWithTimeout(url, options);
       
       // Track rate limits
       if (response.headers.has('X-RateLimit-Limit')) {
@@ -915,7 +894,6 @@ class CybernateAI {
         this.rateLimit.reset = parseInt(response.headers.get('X-RateLimit-Reset'), 10);
       }
       
-      // Enhanced error handling
       if (!response.ok) {
         let errorData;
         try {
@@ -923,16 +901,7 @@ class CybernateAI {
         } catch (e) {
           errorData = { message: `HTTP ${response.status}: ${response.statusText}` };
         }
-        
-        // Log the full error for debugging
-        console.error('API Error Response:', {
-          status: response.status,
-          statusText: response.statusText,
-          url,
-          errorData
-        });
-        
-        // Specific error messages for common issues
+
         if (response.status === 401) {
           throw new Error(`Authentication failed: ${errorData.message || 'Invalid API key'}`);
         } else if (response.status === 403) {
@@ -946,10 +915,7 @@ class CybernateAI {
         }
       }
       
-      const responseData = await response.json();
-      console.log('API Response:', { status: response.status, data: responseData });
-      
-      return responseData;
+      return await response.json();
     } catch (error) {
       // Enhanced error context
       if (error.message.includes('fetch')) {
@@ -957,6 +923,31 @@ class CybernateAI {
       }
       
       throw new Error(`API request failed: ${error.message}`);
+    }
+  }
+
+  /**
+   * fetch with a real timeout via AbortController.
+   * (Plain fetch ignores a `timeout` option — this enforces this.timeout.)
+   * @private
+   */
+  async _fetchWithTimeout(url, options = {}, timeoutMs) {
+    const ms = timeoutMs || this.timeout;
+    const supportsAbort = typeof AbortController !== 'undefined';
+    if (!supportsAbort) {
+      return fetch(url, options);
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        throw new Error(`Request timed out after ${ms}ms: ${url}`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -1004,40 +995,29 @@ class CybernateAI {
           forceNew: true
         });
         
-        // Set up event handlers
         this.socket.on('connect', () => {
-          console.log('Connected to Cybernate events socket');
           this.reconnectCount = 0;
           resolve();
         });
-        
+
         this.socket.on('disconnect', (reason) => {
-          console.log('Disconnected from Cybernate events socket:', reason);
-          
-          // If disconnect was due to server, try to reconnect
           if (reason === 'io server disconnect' && this.autoReconnect) {
             setTimeout(() => {
               if (this.reconnectCount < this.reconnectAttempts) {
                 this.reconnectCount++;
-                console.log(`Attempting to reconnect (${this.reconnectCount}/${this.reconnectAttempts})...`);
                 this._setupWebSocket().catch(() => {});
               }
             }, this.reconnectDelay);
           }
         });
-        
+
         this.socket.on('connect_error', (error) => {
-          console.error('Socket connection error:', error.message);
-          
-          // If this is the initial connection attempt, reject
           if (this.reconnectCount === 0) {
             reject(new Error(`WebSocket connection failed: ${error.message}`));
           }
         });
-        
-        this.socket.on('error', (error) => {
-          console.error('Socket error:', error);
-        });
+
+        this.socket.on('error', () => {});
         
         // Listen for events and dispatch to registered listeners
         this.socket.on('event', (eventData) => {
@@ -1061,18 +1041,14 @@ class CybernateAI {
           });
         });
         
-        // Set connection timeout
         const connectionTimeout = setTimeout(() => {
           if (!this.socket?.connected) {
             this.socket?.disconnect();
             reject(new Error('WebSocket connection timeout'));
           }
         }, this.timeout);
-        
-        // Clear timeout on successful connection
-        this.socket.on('connect', () => {
-          clearTimeout(connectionTimeout);
-        });
+
+        this.socket.once('connect', () => clearTimeout(connectionTimeout));
         
       } catch (error) {
         reject(new Error(`Failed to initialize WebSocket: ${error.message}`));
@@ -1137,6 +1113,374 @@ class CybernateAI {
       return false;
     }
   }
+
+  // ===== AI METHODS =====
+
+  /**
+   * Send a chat message to the AI engine.
+   * @param {Array<{role: string, content: string}>} messages
+   * @param {Object} [options]
+   * @param {string} [options.model] - Model ID, defaults to 'default'
+   * @param {number} [options.maxTokens] - Max tokens to generate (default 400)
+   * @param {number} [options.temperature] - Sampling temperature 0–1
+   * @returns {Promise<{result: string, usage: Object, model: string}>}
+   */
+  async chat(messages, options = {}) {
+    this._ensureConnected();
+    return this._request('POST', '/ai/chat', {
+      messages,
+      model: options.model || 'default',
+      maxTokens: options.maxTokens,
+      temperature: options.temperature,
+    });
+  }
+
+  /**
+   * Generate vector embeddings for one or more texts.
+   * @param {string|string[]} texts
+   * @param {string} [model] - Embedding model (default 'all-MiniLM-L6-v2')
+   * @returns {Promise<{embeddings: number[][], model: string}>}
+   */
+  async embed(texts, model) {
+    this._ensureConnected();
+    return this._request('POST', '/ai/embed', {
+      texts: Array.isArray(texts) ? texts : [texts],
+      model,
+    });
+  }
+
+  /**
+   * Run object detection on an image.
+   * @param {Object} options
+   * @param {string} [options.imageBase64] - Base64-encoded image
+   * @param {string} [options.imageUrl] - URL of the image
+   * @param {string} [options.model] - Detection model (default 'rt-detr')
+   * @param {number} [options.confidence] - Confidence threshold 0–1
+   * @param {string[]} [options.classes] - Object classes to detect
+   * @returns {Promise<{detections: Object[], model: string}>}
+   */
+  async detectObjects(options = {}) {
+    this._ensureConnected();
+    return this._request('POST', '/ai/vision/detect', {
+      image_base64: options.imageBase64,
+      image_url: options.imageUrl,
+      model: options.model,
+      confidence: options.confidence,
+      classes: options.classes,
+    });
+  }
+
+  /**
+   * Stream a chat response token-by-token (Server-Sent Events).
+   * @param {Array<{role: string, content: string}>} messages
+   * @param {Object} [options]
+   * @param {string} [options.model] - Model ID, defaults to 'default'
+   * @param {number} [options.maxTokens] - Max tokens to generate
+   * @param {number} [options.temperature] - Sampling temperature 0–1
+   * @param {string} [options.systemPrompt] - System prompt override
+   * @param {string} [options.sessionId] - Session ID for conversation memory
+   * @param {Function} [onChunk] - Called with each text fragment as it arrives
+   * @returns {Promise<string>} - The full response text once the stream ends
+   */
+  async chatStream(messages, options = {}, onChunk) {
+    this._ensureConnected();
+    if (typeof options === 'function') {
+      onChunk = options;
+      options = {};
+    }
+
+    const response = await this._fetchWithTimeout(`${this.baseUrl}/ai/chat`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.apiKey}`,
+        'X-API-Key': this.apiKey,
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream'
+      },
+      body: JSON.stringify({
+        messages,
+        model: options.model || 'default',
+        maxTokens: options.maxTokens,
+        temperature: options.temperature,
+        systemPrompt: options.systemPrompt,
+        session_id: options.sessionId,
+        stream: true
+      })
+    }, options.timeout || 300000);
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.message || `HTTP error ${response.status}`);
+    }
+
+    let fullText = '';
+    let buffer = '';
+
+    const handleSSE = (textChunk) => {
+      buffer += textChunk;
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) !== -1) {
+        const event = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const data = event.replace(/^data:\s*/, '').trim();
+        if (!data || data === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(data);
+          const content = parsed.choices?.[0]?.delta?.content;
+          if (content) {
+            fullText += content;
+            if (onChunk) onChunk(content);
+          }
+        } catch (e) { /* partial line — wait for more data */ }
+      }
+    };
+
+    if (response.body && typeof response.body.getReader === 'function') {
+      // WHATWG streams (browsers, Node 18+ native fetch)
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        handleSSE(decoder.decode(value, { stream: true }));
+      }
+    } else if (response.body && typeof response.body[Symbol.asyncIterator] === 'function') {
+      // Node.js readable streams (node-fetch / cross-fetch)
+      for await (const chunk of response.body) {
+        handleSSE(chunk.toString('utf8'));
+      }
+    } else {
+      // No streaming support — fall back to reading the whole body
+      handleSSE(await response.text());
+    }
+
+    return fullText;
+  }
+
+  /**
+   * Extract structured JSON from text using a schema you define.
+   * The building block for custom applications: fraud triage, document
+   * extraction, agricultural reports, IoT alert parsing, etc.
+   * @param {string} prompt - The text/instruction to analyze
+   * @param {Object} schema - JSON Schema describing the output you want
+   * @param {Object} [options]
+   * @param {string} [options.model] - Model ID
+   * @param {number} [options.temperature] - Default 0.1 for deterministic output
+   * @returns {Promise<{result: Object, model: string, latencyMs: number}>}
+   */
+  async structured(prompt, schema, options = {}) {
+    this._ensureConnected();
+    return this._request('POST', '/ai/structured', {
+      prompt,
+      schema,
+      model: options.model,
+      temperature: options.temperature
+    });
+  }
+
+  /**
+   * Moderate user content (text and/or image) — built for social platforms.
+   * Understands African languages, pidgin, and local slang.
+   * @param {Object} options
+   * @param {string} [options.text] - Text content to moderate
+   * @param {string} [options.imageBase64] - Base64-encoded image to scan
+   * @param {string} [options.imageUrl] - URL of an image to scan
+   * @param {string} [options.context] - Platform context (e.g. "comments on a news post")
+   * @returns {Promise<{flagged: boolean, severity: string, action: string, text: Object, image: Object}>}
+   *  - severity: none | low | medium | high | critical
+   *  - action: allow | review | block
+   *  - text.categories: per-category scores 0–1 (hate, harassment, violence, ...)
+   *  - image.dangerousObjects: detected weapons/dangerous items, if an image was given
+   */
+  async moderate(options = {}) {
+    this._ensureConnected();
+    if (!options.text && !options.imageBase64 && !options.imageUrl) {
+      throw new Error('Provide text, imageBase64, or imageUrl to moderate');
+    }
+    return this._request('POST', '/ai/moderate', {
+      text: options.text,
+      imageBase64: options.imageBase64,
+      imageUrl: options.imageUrl,
+      context: options.context
+    });
+  }
+
+  /**
+   * Analyze a news article or incident report and extract structured
+   * danger-zone data: locations, incident type, category, severity,
+   * casualties, and safety advice. Built for security intelligence (Sety).
+   * @param {Object} options
+   * @param {string} options.text - Article body / report text (required)
+   * @param {string} [options.title] - Headline
+   * @param {string} [options.url] - Source URL
+   * @param {string} [options.publishedAt] - Publication date (ISO string)
+   * @returns {Promise<{analysis: Object, model: string, latencyMs: number}>}
+   *  analysis: { is_security_relevant, incident_type, category, severity (1-10),
+   *              locations: [{name, city, state, country, specificity}],
+   *              date, actors, targets, casualties, summary, safety_advice }
+   */
+  async analyzeNews(options = {}) {
+    this._ensureConnected();
+    if (!options.text) {
+      throw new Error('text is required');
+    }
+    return this._request('POST', '/ai/analyze/news', {
+      text: options.text,
+      title: options.title,
+      url: options.url,
+      publishedAt: options.publishedAt
+    });
+  }
+
+  /**
+   * Anthropic-style messages API — a familiar, uniform shape that serves
+   * every text task (analysis, news, moderation prompts, summarization...).
+   * Code written against `client.messages.create({...})` works as-is:
+   *
+   *   const message = await cybernate.messages.create({
+   *     model: 'default',
+   *     max_tokens: 700,
+   *     system: SYSTEM_PROMPT,
+   *     messages: [{ role: 'user', content: buildPrompt(title, body) }],
+   *   });
+   *   const text = message.content[0].text;
+   *
+   * Tip: if you are prompting for JSON, prefer `structured(prompt, schema)` —
+   * the platform parses (and repairs) the JSON server-side, so you don't need
+   * the ```json fence-stripping cleanup.
+   */
+  get messages() {
+    const self = this;
+    return {
+      /**
+       * @param {Object} params
+       * @param {string} [params.model] - Model ID (default 'default')
+       * @param {number} [params.max_tokens] - Max tokens to generate
+       * @param {string} [params.system] - System prompt
+       * @param {Array<{role: string, content: string}>} params.messages
+       * @param {number} [params.temperature]
+       * @returns {Promise<{id, model, role, content: [{type: 'text', text}], usage}>}
+       */
+      async create(params = {}) {
+        self._ensureConnected();
+        if (!params.messages || !params.messages.length) {
+          throw new Error('messages is required');
+        }
+        const resp = await self._request('POST', '/ai/chat', {
+          messages: params.messages,
+          model: params.model || 'default',
+          maxTokens: params.max_tokens,
+          temperature: params.temperature,
+          systemPrompt: params.system,
+          session_id: params.session_id
+        });
+        return {
+          id: resp.requestId,
+          type: 'message',
+          role: 'assistant',
+          model: resp.model,
+          content: [{ type: 'text', text: resp.result || '' }],
+          stop_reason: 'end_turn',
+          usage: {
+            input_tokens: resp.usage?.tokensIn || 0,
+            output_tokens: resp.usage?.tokensOut || 0
+          }
+        };
+      }
+    };
+  }
+
+  /**
+   * List available AI models.
+   * @returns {Promise<{local: Object[], remote: Object[]}>}
+   */
+  async listModels() {
+    this._ensureConnected();
+    return this._request('GET', '/ai/models');
+  }
+
+  // ===== CONVERSATION METHODS =====
+
+  /**
+   * List all conversations for the authenticated user.
+   * @returns {Promise<{conversations: Object[]}>}
+   */
+  async listConversations() {
+    this._ensureConnected();
+    return this._request('GET', '/conversations');
+  }
+
+  /**
+   * Create a new conversation.
+   * @param {string} [title]
+   * @returns {Promise<{conversation: Object}>}
+   */
+  async createConversation(title) {
+    this._ensureConnected();
+    return this._request('POST', '/conversations', { title });
+  }
+
+  /**
+   * Get a conversation and its messages.
+   * @param {string} conversationId
+   * @returns {Promise<{conversation: Object, messages: Object[]}>}
+   */
+  async getConversation(conversationId) {
+    this._ensureConnected();
+    return this._request('GET', `/conversations/${conversationId}`);
+  }
+
+  /**
+   * Update a conversation (title or pinned state).
+   * @param {string} conversationId
+   * @param {Object} updates - { title?, pinned? }
+   * @returns {Promise<{conversation: Object}>}
+   */
+  async updateConversation(conversationId, updates) {
+    this._ensureConnected();
+    return this._request('PATCH', `/conversations/${conversationId}`, updates);
+  }
+
+  /**
+   * Delete a conversation and all its messages.
+   * @param {string} conversationId
+   * @returns {Promise<{success: boolean}>}
+   */
+  async deleteConversation(conversationId) {
+    this._ensureConnected();
+    return this._request('DELETE', `/conversations/${conversationId}`);
+  }
+
+  /**
+   * Send a message in a conversation and get an AI reply.
+   * The full conversation history is used for context automatically.
+   * @param {string} conversationId
+   * @param {string} content - The user message
+   * @param {Object} [options]
+   * @param {string} [options.model] - Model ID
+   * @returns {Promise<{result: string, usage: Object, model: string, conversationTitle: string}>}
+   */
+  async sendMessage(conversationId, content, options = {}) {
+    this._ensureConnected();
+    return this._request('POST', `/conversations/${conversationId}/messages`, {
+      content,
+      model: options.model,
+    });
+  }
+
+  /**
+   * Rate an AI message (thumbs up / thumbs down).
+   * @param {string} conversationId
+   * @param {string} messageId
+   * @param {'up'|'down'|null} rating
+   * @returns {Promise<{message: Object}>}
+   */
+  async rateMessage(conversationId, messageId, rating) {
+    this._ensureConnected();
+    return this._request('PATCH', `/conversations/${conversationId}/messages/${messageId}/rate`, { rating });
+  }
+
+  // ===== INTERNAL =====
 
   /**
    * Ensure client is connected

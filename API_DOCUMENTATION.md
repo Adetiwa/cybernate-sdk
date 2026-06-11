@@ -9,6 +9,17 @@
   - [Constructor](#constructor)
   - [connect](#connect)
   - [disconnect](#disconnect)
+- [AI Service](#ai-service)
+  - [chat](#chat)
+  - [messages.create](#messagescreate)
+  - [chatStream](#chatstream)
+  - [structured](#structured)
+  - [moderate](#moderate)
+  - [analyzeNews](#analyzenews)
+  - [embed](#embed)
+  - [detectObjects](#detectobjects)
+  - [listModels](#listmodels)
+  - [Recipe: video scanning](#recipe-video-scanning)
 - [Event Service](#event-service)
   - [watch](#watch)
   - [unwatch](#unwatch)
@@ -134,6 +145,309 @@ Disconnects from the Cybernate service and cleans up resources.
 // When your application is shutting down
 cybernate.disconnect();
 ```
+
+## AI Service
+
+All AI methods require a prior `connect()` call and count toward your
+subscription's token usage. Errors surface as thrown `Error`s with the
+server message included.
+
+### chat
+
+```javascript
+chat(messages, options?)
+```
+
+One-shot chat completion.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `messages` | `Array<{role, content}>` | Yes | Conversation messages; roles: `system`, `user`, `assistant` |
+| `options.model` | string | No | Model ID (default `'default'`) |
+| `options.maxTokens` | number | No | Max tokens to generate |
+| `options.temperature` | number | No | Sampling temperature 0–1 |
+
+**Returns:** `Promise<{ success, requestId, result, usage: { tokensIn, tokensOut, totalTokens, latencyMs }, model }>`
+
+**Example:**
+```javascript
+const { result, usage } = await cybernate.chat(
+  [{ role: 'user', content: 'Summarize this report: ...' }],
+  { maxTokens: 400 }
+);
+```
+
+### messages.create
+
+```javascript
+messages.create(params)
+```
+
+Anthropic-style messages API — the same engine as `chat()`, exposed in a
+familiar shape so a single pattern serves every text task (news analysis,
+moderation prompts, classification, summarization).
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `params.messages` | `Array<{role, content}>` | Yes | Conversation messages |
+| `params.model` | string | No | Model ID (default `'default'`) |
+| `params.max_tokens` | number | No | Max tokens to generate |
+| `params.system` | string | No | System prompt |
+| `params.temperature` | number | No | Sampling temperature |
+
+**Returns:** `Promise<{ id, type, role, model, content: [{ type: 'text', text }], stop_reason, usage: { input_tokens, output_tokens } }>`
+
+**Example:**
+```javascript
+const message = await cybernate.messages.create({
+  model: 'default',
+  max_tokens: 700,
+  system: SYSTEM_PROMPT,
+  messages: [{ role: 'user', content: buildPrompt(title, body) }],
+});
+const text = message.content[0].text;
+```
+
+> If your prompt asks for JSON, prefer [`structured`](#structured) — the
+> platform parses and repairs the JSON server-side, so no
+> ` ```json `-fence cleanup is needed.
+
+### chatStream
+
+```javascript
+chatStream(messages, options?, onChunk?)
+```
+
+Streams the response token-by-token over Server-Sent Events. `onChunk` is
+called with each text fragment; the promise resolves with the full text.
+
+**Example:**
+```javascript
+const full = await cybernate.chatStream(
+  [{ role: 'user', content: 'Tell me about Nairobi' }],
+  { sessionId: 'user-42' },
+  (chunk) => process.stdout.write(chunk)
+);
+```
+
+### structured
+
+```javascript
+structured(prompt, schema, options?)
+```
+
+Schema-constrained JSON extraction. Define the JSON you want; the platform
+prompts the model, parses the output, and retries/repairs invalid JSON
+before returning. This is the generic building block for custom
+applications: fraud triage, KYC document extraction, agricultural field
+reports, IoT alert classification, and more.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `prompt` | string | Yes | The text/instruction to analyze |
+| `schema` | object | Yes | JSON Schema describing the desired output |
+| `options.model` | string | No | Model ID |
+| `options.temperature` | number | No | Default 0.1 for deterministic output |
+
+**Returns:** `Promise<{ success, requestId, result, model, latencyMs }>` — `result` is the parsed object.
+
+**Example (fintech fraud triage):**
+```javascript
+const { result } = await cybernate.structured(transactionDescription, {
+  type: 'object',
+  properties: {
+    fraud_risk: { type: 'number', description: 'risk score 0-1' },
+    signals: { type: 'array', items: { type: 'string' } },
+    recommended_action: { type: 'string', enum: ['approve', 'challenge', 'block'] },
+  },
+});
+```
+
+### moderate
+
+```javascript
+moderate(options)
+```
+
+Content moderation for text and/or images — built for social platforms
+(e.g. Whatever). The text verdict understands African languages, pidgin,
+and local slang; images are scanned for dangerous objects, and the stricter
+of the two verdicts wins.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `options.text` | string | One of text/image | Text content to moderate |
+| `options.imageBase64` | string | One of text/image | Base64-encoded image |
+| `options.imageUrl` | string | One of text/image | Image URL |
+| `options.context` | string | No | Platform context, e.g. `"comments on a news post"` |
+
+**Returns:**
+```javascript
+{
+  success: true,
+  requestId: '...',
+  flagged: true,
+  severity: 'high',          // none | low | medium | high | critical
+  action: 'review',          // allow | review | block
+  text: {                    // null if no text given
+    flagged: true,
+    categories: { hate: 0.1, harassment: 0.8, violence: 0.2, sexual: 0,
+                  self_harm: 0, spam: 0.1, scam_fraud: 0, misinformation: 0,
+                  illegal_goods: 0 },
+    severity: 'high',
+    action: 'review',
+    reason: 'Targeted harassment of a named individual',
+    language: 'Nigerian Pidgin'
+  },
+  image: {                   // null if no image given
+    detections: [...],
+    dangerousObjects: [{ label: 'knife', confidence: 0.91, bbox: [...] }],
+    flagged: true
+  },
+  latencyMs: 1840
+}
+```
+
+**Example:**
+```javascript
+const verdict = await cybernate.moderate({
+  text: post.caption,
+  imageUrl: post.imageUrl,
+  context: 'public posts on a social feed',
+});
+if (verdict.action === 'block') await hidePost(post);
+else if (verdict.action === 'review') await queueForModerator(post);
+```
+
+### analyzeNews
+
+```javascript
+analyzeNews(options)
+```
+
+Extracts structured danger-zone intelligence from a news article or
+incident report — locations (down to neighbourhood/road level when stated),
+incident type, category, severity 1–10, casualties, and safety advice.
+Built to feed safety platforms like Sety: the output maps directly onto a
+danger-zone record.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `options.text` | string | Yes | Article body / report text |
+| `options.title` | string | No | Headline |
+| `options.url` | string | No | Source URL |
+| `options.publishedAt` | string | No | Publication date (ISO) |
+
+**Returns:**
+```javascript
+{
+  success: true,
+  requestId: '...',
+  analysis: {
+    is_security_relevant: true,
+    incident_type: 'kidnapping',   // armed_robbery | kidnapping | terrorism | banditry |
+                                   // protest | communal_clash | cult_violence | theft |
+                                   // assault | natural_disaster | fire | accident | fraud | other
+    category: 'crime',             // crime | terrorism | civil_unrest | disaster | accident | other
+    severity: 8,                   // 1-10
+    locations: [{
+      name: 'Abuja-Kaduna expressway, near Katari',
+      city: 'Katari', state: 'Kaduna', country: 'Nigeria',
+      specificity: 'area'          // exact | area | city | state | country
+    }],
+    date: '2026-06-10',
+    actors: ['armed gunmen'],
+    targets: ['travellers'],
+    casualties: { killed: 2, injured: 5, kidnapped: 12 },
+    summary: 'Gunmen attacked travellers along the Abuja-Kaduna expressway...',
+    safety_advice: 'Avoid the Katari stretch of the expressway; travel in convoys during daylight.'
+  },
+  model: 'cyb-1',
+  latencyMs: 2310
+}
+```
+
+**Example (news pipeline → Sety danger zones):**
+```javascript
+for (const article of await fetchNewsBatch()) {
+  const { analysis } = await cybernate.analyzeNews({
+    title: article.title,
+    text: article.body,
+    url: article.link,
+    publishedAt: article.publishedAt,
+  });
+  if (analysis.is_security_relevant && analysis.severity >= 5) {
+    await sety.createDangerZone(analysis);
+  }
+}
+```
+
+### embed
+
+```javascript
+embed(texts, model?)
+```
+
+Generates dense vector embeddings for semantic search / RAG.
+
+**Returns:** `Promise<{ success, requestId, embeddings: number[][], model, latencyMs }>`
+
+### detectObjects
+
+```javascript
+detectObjects(options)
+```
+
+Object detection on an image (`imageBase64` or `imageUrl`), with optional
+`confidence` threshold and `classes` label filter.
+
+**Returns:** `Promise<{ success, requestId, detections: [{ label, confidence, bbox }], model, latencyMs }>`
+
+### listModels
+
+```javascript
+listModels()
+```
+
+Lists available models. **Returns:** `Promise<{ local, remote }>`
+
+### Recipe: video scanning
+
+Video moderation/analysis = frame sampling + the image methods. Sample
+1 frame per second (ffmpeg), moderate each frame, and flag the video if any
+frame is flagged:
+
+```javascript
+const { execSync } = require('child_process');
+const fs = require('fs');
+
+// 1 fps frame extraction
+execSync(`ffmpeg -i ${videoPath} -vf fps=1 /tmp/frames/frame_%04d.jpg`);
+
+let verdict = { flagged: false, severity: 'none', frames: [] };
+for (const f of fs.readdirSync('/tmp/frames')) {
+  const result = await cybernate.moderate({
+    imageBase64: fs.readFileSync(`/tmp/frames/${f}`).toString('base64'),
+  });
+  if (result.flagged) {
+    verdict.flagged = true;
+    verdict.frames.push({ frame: f, ...result });
+  }
+}
+```
+
+For live streams, use `watch()` instead — the platform samples and analyzes
+frames server-side and pushes events over WebSocket/webhooks.
 
 ## Event Service
 
