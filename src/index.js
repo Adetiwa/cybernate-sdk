@@ -48,6 +48,9 @@ class CybernateAI {
     this.isConnecting = false;
     this.reconnectCount = 0;
     
+    // Live video streaming (https://live.cybernate.ai) — see createStreamingApi below
+    this.streaming = createStreamingApi(this);
+
     // Track rate limits
     this.rateLimit = {
       limit: 0,
@@ -915,6 +918,8 @@ class CybernateAI {
         }
       }
       
+      // 204 No Content (e.g. deletes) has no body
+      if (response.status === 204) return null;
       return await response.json();
     } catch (error) {
       // Enhanced error context
@@ -1492,6 +1497,102 @@ class CybernateAI {
     }
   }
 }
+
+// ===== STREAMING =====
+
+function queryString(params) {
+  const q = new URLSearchParams();
+  Object.entries(params || {}).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== '') q.append(k, v instanceof Date ? v.toISOString() : String(v));
+  });
+  const s = q.toString();
+  return s ? `?${s}` : '';
+}
+
+/**
+ * Live streaming API: `client.streaming.*`.
+ * A stream is one broadcast: create it, give `ingest.stream_url` (or rtmp_url +
+ * stream_key) to the broadcaster, show `playback.hls_url` to viewers. Lifecycle
+ * changes arrive as signed webhooks (see CybernateAI.verifyWebhook) and are
+ * billed from your Cybernate credits (live minutes + viewer minutes).
+ * @param {CybernateAI} client
+ */
+function createStreamingApi(client) {
+  const req = (method, path, body) => client._request(method, `/streaming${path}`, body);
+  const unwrap = (res) => (res && res.data !== undefined ? res.data : res);
+  const enc = encodeURIComponent;
+
+  return {
+    /**
+     * Create a stream. The stream key is only returned here (and on resetKey).
+     * @param {{title?: string, external_id?: string, metadata?: object}} [params]
+     */
+    createStream: async (params = {}) => unwrap(await req('POST', '/streams', params)),
+    /** @param {{status?: string, external_id?: string, limit?: number, starting_after?: string}} [params] */
+    listStreams: async (params = {}) => req('GET', `/streams${queryString(params)}`),
+    getStream: async (streamId) => unwrap(await req('GET', `/streams/${enc(streamId)}`)),
+    updateStream: async (streamId, changes) => unwrap(await req('PATCH', `/streams/${enc(streamId)}`, changes)),
+    /** End the stream now; the broadcaster is disconnected. */
+    endStream: async (streamId) => unwrap(await req('POST', `/streams/${enc(streamId)}/end`)),
+    /** Only while the stream is idle (not yet live). Returns the new key. */
+    resetStreamKey: async (streamId) => unwrap(await req('POST', `/streams/${enc(streamId)}/reset-key`)),
+    deleteStream: async (streamId) => { await req('DELETE', `/streams/${enc(streamId)}`); return true; },
+    /** { current, peak, unique, viewer_seconds } */
+    getViewers: async (streamId) => unwrap(await req('GET', `/streams/${enc(streamId)}/viewers`)),
+
+    /** Recent lifecycle events (with webhook delivery status). */
+    listEvents: async (params = {}) => req('GET', `/events${queryString(params)}`),
+    redeliverEvent: async (eventId) => unwrap(await req('POST', `/events/${enc(eventId)}/redeliver`)),
+
+    /** Webhook endpoint + signing secret for your business. */
+    getSettings: async () => unwrap(await req('GET', '/settings')),
+    /** @param {{webhook_url?: string|null}} changes */
+    updateSettings: async (changes) => unwrap(await req('PATCH', '/settings', changes)),
+    rotateWebhookSecret: async () => unwrap(await req('POST', '/settings/webhook-secret/rotate')),
+    getWebhookSecret: async () => unwrap(await req('GET', '/settings/webhook-secret')),
+    sendTestWebhook: async () => unwrap(await req('POST', '/settings/webhook-test')),
+
+    /** Billed usage: { totals, rates, items }. Defaults to the last 30 days. */
+    getUsage: async (params = {}) => unwrap(await req('GET', `/usage${queryString(params)}`)),
+  };
+}
+
+/**
+ * Verify a Cybernate webhook (streaming events).
+ * Header: `Cybernate-Signature: t=<unix>,v1=<hex HMAC-SHA256(secret, "<t>.<rawBody>")>`.
+ * Use the RAW request body (not re-serialised JSON). Works in Node 18+ and browsers.
+ * @param {string} secret - webhook signing secret (whsec_…)
+ * @param {string} rawBody
+ * @param {string} signatureHeader
+ * @param {number} [toleranceSeconds=300] - reject older timestamps (replay protection)
+ * @returns {Promise<boolean>}
+ */
+async function verifyWebhook(secret, rawBody, signatureHeader, toleranceSeconds = 300) {
+  const parts = String(signatureHeader || '').split(',').reduce((acc, part) => {
+    const [k, v] = part.split('=');
+    if (k === 't') acc.t = Number(v);
+    else if (k === 'v1' && v) acc.v1.push(v);
+    return acc;
+  }, { t: null, v1: [] });
+  if (!parts.t || parts.v1.length === 0) return false;
+  if (Math.abs(Math.floor(Date.now() / 1000) - parts.t) > toleranceSeconds) return false;
+
+  const subtle = (typeof globalThis !== 'undefined' && globalThis.crypto && globalThis.crypto.subtle) || null;
+  if (!subtle) throw new Error('verifyWebhook requires the Web Crypto API (Node 18+ or a modern browser)');
+  const enc = new TextEncoder();
+  const key = await subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await subtle.sign('HMAC', key, enc.encode(`${parts.t}.${rawBody}`));
+  const expected = Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  // constant-time compare
+  return parts.v1.some((candidate) => {
+    if (candidate.length !== expected.length) return false;
+    let diff = 0;
+    for (let i = 0; i < expected.length; i++) diff |= candidate.charCodeAt(i) ^ expected.charCodeAt(i);
+    return diff === 0;
+  });
+}
+
+CybernateAI.verifyWebhook = verifyWebhook;
 
 // Export for both CommonJS and ES modules
 if (typeof module !== 'undefined' && module.exports) {
